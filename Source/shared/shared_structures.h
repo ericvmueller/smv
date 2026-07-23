@@ -176,6 +176,10 @@ typedef struct _terraindata {
   int nvalues; // number of values above zmin
   unsigned char *uc_znormal;
   struct _meshdata *terrain_mesh;
+  GLuint vbo, ebo, ebo_bottom;
+  int nindices, nindices_bottom;
+  int vbo_skip;
+  int vbo_valid;
 } terraindata;
 
 /* --------------------------  mesh ----------------------------------------- */

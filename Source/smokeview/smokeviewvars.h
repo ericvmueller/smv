@@ -346,6 +346,16 @@ SVEXTERN float SVDECL(*terrain_vertices, NULL), SVDECL(*terrain_tvertices, NULL)
 SVEXTERN unsigned int SVDECL(*terrain_indices, NULL);
 SVEXTERN int SVDECL(terrain_nindices, 0);
 SVEXTERN int SVDECL(terrain_nfaces, 0);
+SVEXTERN GLuint SVDECL(terrain_geom_vbo, 0);
+SVEXTERN GLuint SVDECL(terrain_geom_ebo_all, 0);
+SVEXTERN GLuint SVDECL(terrain_geom_ebo_top, 0);
+SVEXTERN GLuint SVDECL(terrain_geom_ebo_side, 0);
+SVEXTERN GLuint SVDECL(terrain_geom_ebo_outline, 0);
+SVEXTERN int SVDECL(terrain_geom_n_all, 0);
+SVEXTERN int SVDECL(terrain_geom_n_top, 0);
+SVEXTERN int SVDECL(terrain_geom_n_side, 0);
+SVEXTERN int SVDECL(terrain_geom_n_outline, 0);
+SVEXTERN int SVDECL(terrain_geom_vbo_valid, 0);
 
 
 SVEXTERN int SVDECL(terrain_show_geometry_surface, 1);

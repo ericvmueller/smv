@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include "glew.h"
 #include GLUT_H
 
 #include "smokeviewvars.h"
@@ -15,12 +16,433 @@
                            returncode=fread(var,4,size,WUIFILE);\
                            FSEEK(WUIFILE,4,SEEK_CUR)
 
+#define TGEOM_FLOATS 12
+#define TGEOM_STRIDE (TGEOM_FLOATS*sizeof(float))
+#define TOBST_FLOATS 8
+#define TOBST_STRIDE (TOBST_FLOATS*sizeof(float))
+#define FDS_OFFSET 0.005
+#ifndef ZOFFSET
+#define ZOFFSET 0.001
+#endif
+
+static float terrain_geom_baked_exag = -999.0;
+static float terrain_geom_baked_zmin = 0.0;
+static int terrain_geom_baked_inside = -1;
+static int terrain_geom_baked_outside = -1;
+static int terrain_geom_baked_boundary = -1;
+static int terrain_geom_baked_showonly_top = -1;
+
+int InDomain(float *v1, float *v2, float *v3);
+
+/* ------------------ TerrainVBOAvailable ------------------------ */
+
+static int TerrainVBOAvailable(void){
+  return (GLEW_VERSION_1_5 || GLEW_ARB_vertex_buffer_object) ? 1 : 0;
+}
+
+/* ------------------ FreeTerrainGeomVBO ------------------------ */
+
+void FreeTerrainGeomVBO(void){
+  if(TerrainVBOAvailable()==0){
+    terrain_geom_vbo_valid = 0;
+    return;
+  }
+  if(terrain_geom_vbo!=0)glDeleteBuffers(1, &terrain_geom_vbo);
+  if(terrain_geom_ebo_all!=0)glDeleteBuffers(1, &terrain_geom_ebo_all);
+  if(terrain_geom_ebo_top!=0)glDeleteBuffers(1, &terrain_geom_ebo_top);
+  if(terrain_geom_ebo_side!=0)glDeleteBuffers(1, &terrain_geom_ebo_side);
+  if(terrain_geom_ebo_outline!=0)glDeleteBuffers(1, &terrain_geom_ebo_outline);
+  terrain_geom_vbo = 0;
+  terrain_geom_ebo_all = 0;
+  terrain_geom_ebo_top = 0;
+  terrain_geom_ebo_side = 0;
+  terrain_geom_ebo_outline = 0;
+  terrain_geom_n_all = 0;
+  terrain_geom_n_top = 0;
+  terrain_geom_n_side = 0;
+  terrain_geom_n_outline = 0;
+  terrain_geom_vbo_valid = 0;
+  terrain_geom_baked_exag = -999.0;
+}
+
+/* ------------------ FreeTerrainOBSTVBO ------------------------ */
+
+void FreeTerrainOBSTVBO(terraindata *terri){
+  if(terri==NULL)return;
+  if(TerrainVBOAvailable()==1){
+    if(terri->vbo!=0)glDeleteBuffers(1, &terri->vbo);
+    if(terri->ebo!=0)glDeleteBuffers(1, &terri->ebo);
+    if(terri->ebo_bottom!=0)glDeleteBuffers(1, &terri->ebo_bottom);
+  }
+  terri->vbo = 0;
+  terri->ebo = 0;
+  terri->ebo_bottom = 0;
+  terri->nindices = 0;
+  terri->nindices_bottom = 0;
+  terri->vbo_skip = -1;
+  terri->vbo_valid = 0;
+}
+
+/* ------------------ UploadTerrainGeomVBO ------------------------ */
+
+static void UploadTerrainGeomVBO(int showgeom_inside_domain_local){
+  float *vbo_verts = NULL;
+  unsigned int *idx_all = NULL, *idx_top = NULL, *idx_side = NULL, *idx_outline = NULL;
+  int nverts, i;
+  int n_all = 0, n_top = 0, n_side = 0, n_outline = 0;
+  float zrange;
+
+  if(TerrainVBOAvailable()==0||terrain_nindices<=0||terrain_vertices==NULL||terrain_indices==NULL){
+    terrain_geom_vbo_valid = 0;
+    return;
+  }
+
+  FreeTerrainGeomVBO();
+
+  nverts = 0;
+  for(i = 0; i<terrain_nindices; i++){
+    if((int)terrain_indices[i]+1>nverts)nverts = (int)terrain_indices[i]+1;
+  }
+  if(nverts<=0)return;
+
+  NewMemory((void **)&vbo_verts, nverts*TGEOM_STRIDE);
+  NewMemory((void **)&idx_all, terrain_nindices*sizeof(unsigned int));
+  NewMemory((void **)&idx_top, terrain_nindices*sizeof(unsigned int));
+  NewMemory((void **)&idx_side, terrain_nindices*sizeof(unsigned int));
+  NewMemory((void **)&idx_outline, 2*terrain_nindices*sizeof(unsigned int));
+
+  zrange = terrain_zmax-terrain_zmin;
+  if(zrange==0.0)zrange = 1.0;
+
+  for(i = 0; i<nverts; i++){
+    float *src, *dst;
+    float zorig;
+
+    src = terrain_vertices+9*i;
+    dst = vbo_verts+TGEOM_FLOATS*i;
+    zorig = src[2];
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = terrain_zmin+geom_vert_exag*(zorig-terrain_zmin);
+    dst[3] = src[3];
+    dst[4] = src[4];
+    dst[5] = src[5];
+    dst[6] = src[6];
+    dst[7] = src[7];
+    dst[8] = src[8];
+    if(terrain_tvertices!=NULL){
+      dst[9] = terrain_tvertices[2*i];
+      dst[10] = terrain_tvertices[2*i+1];
+    }
+    else{
+      dst[9] = 0.0;
+      dst[10] = 0.0;
+    }
+    dst[11] = (zorig-terrain_zmin)/zrange;
+  }
+
+  for(i = 0; i<terrain_nindices/3; i++){
+    unsigned int *ind;
+    float *v1, *v2, *v3, *n1;
+    int inside_domain = 0, outside_domain = 1;
+    int accept;
+
+    ind = terrain_indices+3*i;
+    v1 = terrain_vertices+9*ind[0];
+    v2 = terrain_vertices+9*ind[1];
+    v3 = terrain_vertices+9*ind[2];
+    n1 = v1+3;
+
+    if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
+      inside_domain = InDomain(v1, v2, v3);
+      outside_domain = 1-inside_domain;
+    }
+    accept = 1;
+    if(showgeom_inside_domain_local==0&&inside_domain==1)accept = 0;
+    if(showgeom_outside_domain==0&&outside_domain==1)accept = 0;
+    if(accept==0)continue;
+
+    idx_all[n_all++] = ind[0];
+    idx_all[n_all++] = ind[1];
+    idx_all[n_all++] = ind[2];
+
+    if(n1[2]>=0.0){
+      idx_top[n_top++] = ind[0];
+      idx_top[n_top++] = ind[1];
+      idx_top[n_top++] = ind[2];
+    }
+    else{
+      idx_side[n_side++] = ind[0];
+      idx_side[n_side++] = ind[1];
+      idx_side[n_side++] = ind[2];
+    }
+    if(terrain_showonly_top==0||n1[2]>=0.0){
+      idx_outline[n_outline++] = ind[0];
+      idx_outline[n_outline++] = ind[1];
+      idx_outline[n_outline++] = ind[1];
+      idx_outline[n_outline++] = ind[2];
+      idx_outline[n_outline++] = ind[2];
+      idx_outline[n_outline++] = ind[0];
+    }
+  }
+
+  glGenBuffers(1, &terrain_geom_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, terrain_geom_vbo);
+  glBufferData(GL_ARRAY_BUFFER, nverts*TGEOM_STRIDE, vbo_verts, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terrain_geom_ebo_all);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terrain_geom_ebo_all);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_all*sizeof(unsigned int), idx_all, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terrain_geom_ebo_top);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terrain_geom_ebo_top);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_top*sizeof(unsigned int), idx_top, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terrain_geom_ebo_side);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terrain_geom_ebo_side);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_side*sizeof(unsigned int), idx_side, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terrain_geom_ebo_outline);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terrain_geom_ebo_outline);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_outline*sizeof(unsigned int), idx_outline, GL_STATIC_DRAW);
+
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+  terrain_geom_n_all = n_all;
+  terrain_geom_n_top = n_top;
+  terrain_geom_n_side = n_side;
+  terrain_geom_n_outline = n_outline;
+  terrain_geom_baked_exag = geom_vert_exag;
+  terrain_geom_baked_zmin = terrain_zmin;
+  terrain_geom_baked_inside = showgeom_inside_domain_local;
+  terrain_geom_baked_outside = showgeom_outside_domain;
+  terrain_geom_baked_boundary = drawing_boundary_files;
+  terrain_geom_baked_showonly_top = terrain_showonly_top;
+  terrain_geom_vbo_valid = 1;
+
+  FREEMEMORY(vbo_verts);
+  FREEMEMORY(idx_all);
+  FREEMEMORY(idx_top);
+  FREEMEMORY(idx_side);
+  FREEMEMORY(idx_outline);
+}
+
+/* ------------------ EnsureTerrainGeomVBO ------------------------ */
+
+static void EnsureTerrainGeomVBO(int showgeom_inside_domain_local){
+  if(terrain_geom_vbo_valid==1&&
+     terrain_geom_baked_exag==geom_vert_exag&&
+     terrain_geom_baked_zmin==terrain_zmin&&
+     terrain_geom_baked_inside==showgeom_inside_domain_local&&
+     terrain_geom_baked_outside==showgeom_outside_domain&&
+     terrain_geom_baked_boundary==drawing_boundary_files&&
+     terrain_geom_baked_showonly_top==terrain_showonly_top)return;
+  UploadTerrainGeomVBO(showgeom_inside_domain_local);
+}
+
+/* ------------------ BindTerrainGeomArrays ------------------------ */
+
+static void BindTerrainGeomArrays(int use_color, int tex_mode){
+  glBindBuffer(GL_ARRAY_BUFFER, terrain_geom_vbo);
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glVertexPointer(3, GL_FLOAT, TGEOM_STRIDE, (void *)(0*sizeof(float)));
+  glEnableClientState(GL_NORMAL_ARRAY);
+  glNormalPointer(GL_FLOAT, TGEOM_STRIDE, (void *)(3*sizeof(float)));
+  if(use_color==1){
+    glEnableClientState(GL_COLOR_ARRAY);
+    glColorPointer(3, GL_FLOAT, TGEOM_STRIDE, (void *)(6*sizeof(float)));
+  }
+  else{
+    glDisableClientState(GL_COLOR_ARRAY);
+  }
+  if(tex_mode==2){
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, TGEOM_STRIDE, (void *)(9*sizeof(float)));
+  }
+  else if(tex_mode==1){
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(1, GL_FLOAT, TGEOM_STRIDE, (void *)(11*sizeof(float)));
+  }
+  else{
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+  }
+}
+
+/* ------------------ UnbindTerrainGeomArrays ------------------------ */
+
+static void UnbindTerrainGeomArrays(void){
+  glDisableClientState(GL_VERTEX_ARRAY);
+  glDisableClientState(GL_NORMAL_ARRAY);
+  glDisableClientState(GL_COLOR_ARRAY);
+  glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+/* ------------------ DrawTerrainGeomElements ------------------------ */
+
+static void DrawTerrainGeomElements(GLuint ebo, int nindices, GLenum mode){
+  if(nindices<=0||ebo==0)return;
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+  glDrawElements(mode, nindices, GL_UNSIGNED_INT, 0);
+}
+
+/* ------------------ UploadTerrainOBSTVBO ------------------------ */
+
+static void UploadTerrainOBSTVBO(terraindata *terri, int skip, int with_texture){
+  float *znode, *x, *y, *vbo_verts = NULL;
+  unsigned char *uc_znormal;
+  unsigned int *idx_top = NULL, *idx_bottom = NULL;
+  int nycell, nx, ny, nverts, i, j;
+  int n_top = 0, n_bottom = 0;
+  float zcut;
+
+  if(terri==NULL||TerrainVBOAvailable()==0)return;
+  if(terri->znode==NULL||terri->xplt==NULL||terri->yplt==NULL||terri->uc_znormal==NULL)return;
+
+  FreeTerrainOBSTVBO(terri);
+
+  if(skip<1)skip = 1;
+  nx = terri->ibar;
+  ny = terri->jbar;
+  nycell = terri->jbar;
+  nverts = (nx+1)*(ny+1);
+  zcut = terri->zmin_cutoff;
+  znode = terri->znode;
+  uc_znormal = terri->uc_znormal;
+  x = terri->xplt;
+  y = terri->yplt;
+
+  NewMemory((void **)&vbo_verts, nverts*TOBST_STRIDE);
+  NewMemory((void **)&idx_top, 6*(nx/skip+1)*(ny/skip+1)*sizeof(unsigned int));
+  NewMemory((void **)&idx_bottom, 6*(nx/skip+1)*(ny/skip+1)*sizeof(unsigned int));
+
+  for(j = 0; j<=ny; j++){
+    for(i = 0; i<=nx; i++){
+      float *dst, *zn;
+      unsigned char *uc_zn;
+      int k;
+
+      k = IJ2(i, j);
+      dst = vbo_verts+TOBST_FLOATS*k;
+      uc_zn = uc_znormal+k;
+      zn = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn));
+      dst[0] = x[i];
+      dst[1] = y[j];
+      dst[2] = znode[k]+(with_texture==1 ? 0.0 : ZOFFSET);
+      dst[3] = zn[0];
+      dst[4] = zn[1];
+      dst[5] = zn[2];
+      if(with_texture==1){
+        dst[6] = (x[i]-xbar0ORIG)/(xbarORIG-xbar0ORIG);
+        dst[7] = (y[j]-ybar0ORIG)/(ybarORIG-ybar0ORIG);
+      }
+      else{
+        dst[6] = 0.0;
+        dst[7] = 0.0;
+      }
+    }
+  }
+
+  for(j = 0; j<ny; j += skip){
+    int jp1;
+
+    jp1 = j+skip;
+    if(jp1>ny)jp1 = ny;
+    for(i = 0; i<nx; i += skip){
+      int ip1;
+      float zval1, zval2, zval3, zval4;
+      int skip123, skip134;
+      unsigned int i00, i10, i11, i01;
+
+      ip1 = i+skip;
+      if(ip1>nx)ip1 = nx;
+
+      zval1 = znode[IJ2(i, j)];
+      zval2 = znode[IJ2(ip1, j)];
+      zval3 = znode[IJ2(ip1, jp1)];
+      zval4 = znode[IJ2(i, jp1)];
+      if(zval1<zcut&&zval2<zcut&&zval3<zcut&&zval4<zcut)continue;
+
+      skip123 = 0;
+      skip134 = 0;
+      if(zval1<zcut||zval2<zcut||zval3<zcut)skip123 = 1;
+      if(zval1<zcut||zval3<zcut||zval4<zcut)skip134 = 1;
+
+      i00 = (unsigned int)IJ2(i, j);
+      i10 = (unsigned int)IJ2(ip1, j);
+      i11 = (unsigned int)IJ2(ip1, jp1);
+      i01 = (unsigned int)IJ2(i, jp1);
+
+      if(skip123==0){
+        idx_top[n_top++] = i00;
+        idx_top[n_top++] = i10;
+        idx_top[n_top++] = i11;
+        idx_bottom[n_bottom++] = i00;
+        idx_bottom[n_bottom++] = i11;
+        idx_bottom[n_bottom++] = i10;
+      }
+      if(skip134==0){
+        idx_top[n_top++] = i00;
+        idx_top[n_top++] = i11;
+        idx_top[n_top++] = i01;
+        idx_bottom[n_bottom++] = i00;
+        idx_bottom[n_bottom++] = i01;
+        idx_bottom[n_bottom++] = i11;
+      }
+    }
+  }
+
+  glGenBuffers(1, &terri->vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, terri->vbo);
+  glBufferData(GL_ARRAY_BUFFER, nverts*TOBST_STRIDE, vbo_verts, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terri->ebo);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_top*sizeof(unsigned int), idx_top, GL_STATIC_DRAW);
+
+  glGenBuffers(1, &terri->ebo_bottom);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo_bottom);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, n_bottom*sizeof(unsigned int), idx_bottom, GL_STATIC_DRAW);
+
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+  terri->nindices = n_top;
+  terri->nindices_bottom = n_bottom;
+  terri->vbo_skip = skip;
+  terri->vbo_valid = with_texture ? 2 : 1;
+
+  FREEMEMORY(vbo_verts);
+  FREEMEMORY(idx_top);
+  FREEMEMORY(idx_bottom);
+}
+
+/* ------------------ EnsureTerrainOBSTVBO ------------------------ */
+
+static void EnsureTerrainOBSTVBO(terraindata *terri, int skip, int with_texture){
+  int want;
+
+  want = with_texture ? 2 : 1;
+  if(terri->vbo_valid==want&&terri->vbo_skip==skip&&terri->vbo!=0)return;
+  UploadTerrainOBSTVBO(terri, skip, with_texture);
+}
+
 /* ------------------ GenerateTerrainGeom ------------------------ */
 
 void GenerateTerrainGeom(float **vertices_arg, unsigned int **indices_arg, int *nindices_arg){
   geomlistdata *terrain;
   int i, sizeof_indices, sizeof_vertices, sizeof_tvertices, terrain_nindices_local;
   float terrain_xmin, terrain_xmax, terrain_ymin, terrain_ymax;
+
+  FreeTerrainGeomVBO();
+  FREEMEMORY(terrain_vertices);
+  FREEMEMORY(terrain_tvertices);
+  FREEMEMORY(terrain_indices);
+  FREEMEMORY(terrain_colors);
+  terrain_nindices = 0;
+  terrain_nfaces = 0;
 
   if(global_scase.geominfo->geomlistinfo==NULL)return;
   terrain = global_scase.geominfo->geomlistinfo - 1;
@@ -183,12 +605,12 @@ int GetNTerrainTexturesLoaded(void){
 /* ------------------ DrawTerrainGeom ------------------------ */
 
 void DrawTerrainGeom(int option){
-  int i;
   float terrain_shininess = 100.0;
   float terrain_specular[4] = {0.8, 0.8, 0.8, 1.0};
   float neutral_color[4] = {0.91, 0.91, 0.76, 1.0};
-  int draw_surface = 1, draw_texture=0;
+  int draw_surface = 1, draw_texture = 0;
   int showgeom_inside_domain_local;
+  int use_vbo;
 
   draw_texture = HaveTerrainTexture(&draw_surface);
   if(terrain_nindices<=0)return;
@@ -198,9 +620,12 @@ void DrawTerrainGeom(int option){
   }
 
   showgeom_inside_domain_local = showgeom_inside_domain;
-  if(drawing_boundary_files==1)showgeom_inside_domain_local = 0; // hide terrain within FDS domain if drawing boundary files
+  if(drawing_boundary_files==1)showgeom_inside_domain_local = 0;
 
   if(option==DRAW_TRANSPARENT&&draw_texture==0)return;
+
+  EnsureTerrainGeomVBO(showgeom_inside_domain_local);
+  use_vbo = (terrain_geom_vbo_valid==1) ? 1 : 0;
 
   glEnable(GL_NORMALIZE);
   glShadeModel(GL_SMOOTH);
@@ -214,457 +639,209 @@ void DrawTerrainGeom(int option){
   glScalef(SCALE2SMV(1.0), SCALE2SMV(1.0), SCALE2SMV(1.0));
   glTranslatef(-global_scase.xbar0, -global_scase.ybar0, -global_scase.zbar0);
 
-  if(option==DRAW_OPAQUE){
+  if(use_vbo==1){
+    if(option==DRAW_OPAQUE){
+      if(show_faces_shaded==1&&draw_surface==1){
+        int tex_mode = 0;
 
-    //*** surface
-
-    if(show_faces_shaded==1&&draw_surface==1){
-      if(show_texture_1dimage==1){
-        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-        glEnable(GL_TEXTURE_1D);
-        glBindTexture(GL_TEXTURE_1D, terrain_colorbar_id);
-      }
-      glBegin(GL_TRIANGLES);
-
-      // surface
-      for(i = 0; i<terrain_nindices/3; i++){
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        float *c1;
-        float *n1, *n2, *n3;
-        int j;
-        unsigned int *ind;
-        int inside_domain=0, outside_domain=1;
-
-        ind = terrain_indices+3*i;
-
-        c1 = terrain_colors+3*i;
-
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
-          }
-        }
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
-        }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        n1 = v1+3;
-        if(terrain_showonly_top==1&&n1[2]<0.0)continue;
-
-        if(show_texture_1dimage==0)glColor3fv(c1);
-        glNormal3fv(n1);
         if(show_texture_1dimage==1){
-          float texture_z;
-
-          texture_z = (v1[2]-terrain_zmin)/(terrain_zmax-terrain_zmin);
-          glTexCoord1f(texture_z);
+          glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+          glEnable(GL_TEXTURE_1D);
+          glBindTexture(GL_TEXTURE_1D, terrain_colorbar_id);
+          tex_mode = 1;
         }
-        glVertex3fv(v1o);
-
-        n2 = v2+3;
-        glNormal3fv(n2);
-        if(show_texture_1dimage==1){
-          float texture_z;
-
-          texture_z = (v2[2]-terrain_zmin)/(terrain_zmax-terrain_zmin);
-          glTexCoord1f(texture_z);
+        BindTerrainGeomArrays(show_texture_1dimage==0, tex_mode);
+        if(terrain_showonly_top==1){
+          DrawTerrainGeomElements(terrain_geom_ebo_top, terrain_geom_n_top, GL_TRIANGLES);
         }
-        glVertex3fv(v2o);
-
-        n3 = v3+3;
-        glNormal3fv(n3);
-        if(show_texture_1dimage==1){
-          float texture_z;
-
-          texture_z = (v3[2]-terrain_zmin)/(terrain_zmax-terrain_zmin);
-          glTexCoord1f(texture_z);
+        else{
+          DrawTerrainGeomElements(terrain_geom_ebo_all, terrain_geom_n_all, GL_TRIANGLES);
         }
-        glVertex3fv(v3o);
+        UnbindTerrainGeomArrays();
+        if(show_texture_1dimage==1)glDisable(GL_TEXTURE_1D);
       }
-      glEnd();
-      if(show_texture_1dimage == 1)glDisable(GL_TEXTURE_1D);
-    }
 
-#define FDS_OFFSET 0.005
+      if(use_cfaces==0&&show_faces_outline==1){
+        unsigned char outlinecolor_uc[4];
 
-    //*** edges
-
-    if(use_cfaces==0&&show_faces_outline==1){
-      glPushMatrix();
-      glTranslatef(0.0, 0.0, geom_dz_offset);
-      glLineWidth(geom_linewidth);
-      glBegin(GL_LINES);
-
-      // lines
-      unsigned char outlinecolor_uc[4];
-      if(visGrid != 0){
-        outlinecolor_uc[0] = (unsigned char)glui_outlinecolor[0];
-        outlinecolor_uc[1] = (unsigned char)glui_outlinecolor[1];
-        outlinecolor_uc[2] = (unsigned char)glui_outlinecolor[2];
-        outlinecolor_uc[3] = (unsigned char)glui_outlinecolor[3];
+        glPushMatrix();
+        glTranslatef(0.0, 0.0, geom_dz_offset);
+        glLineWidth(geom_linewidth);
+        if(visGrid != 0){
+          outlinecolor_uc[0] = (unsigned char)glui_outlinecolor[0];
+          outlinecolor_uc[1] = (unsigned char)glui_outlinecolor[1];
+          outlinecolor_uc[2] = (unsigned char)glui_outlinecolor[2];
+          outlinecolor_uc[3] = (unsigned char)glui_outlinecolor[3];
+        }
+        else{
+          outlinecolor_uc[0] = 0;
+          outlinecolor_uc[1] = 0;
+          outlinecolor_uc[2] = 0;
+          outlinecolor_uc[3] = 255;
+        }
+        glColor4ubv(outlinecolor_uc);
+        BindTerrainGeomArrays(0, 0);
+        DrawTerrainGeomElements(terrain_geom_ebo_outline, terrain_geom_n_outline, GL_LINES);
+        UnbindTerrainGeomArrays();
+        glPopMatrix();
       }
-      else{
-        outlinecolor_uc[0] = 0;
-        outlinecolor_uc[1] = 0;
-        outlinecolor_uc[2] = 0;
-        outlinecolor_uc[3] = 255;
+
+      if(show_geom_verts==1){
+        glPushMatrix();
+        glTranslatef(0.0, 0.0, geom_dz_offset);
+        glPointSize(geom_pointsize);
+        glColor3fv(foregroundcolor);
+        BindTerrainGeomArrays(0, 0);
+        DrawTerrainGeomElements(terrain_geom_ebo_top, terrain_geom_n_top, GL_POINTS);
+        UnbindTerrainGeomArrays();
+        glPopMatrix();
       }
-      glColor4ubv(outlinecolor_uc);
-      for(i = 0; i<terrain_nfaces; i++){
-        int j;
-        int inside_domain=0, outside_domain=1;
 
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        float *n1;
-        unsigned int *ind;
+      if(terrain_showonly_top==1&&(show_faces_shaded==1||draw_texture==1)){
+        GLboolean cull_was;
+        GLint light_model;
 
-        ind = terrain_indices+3*i;
-
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
-        }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        n1 = v1+3;
-        if(terrain_showonly_top==1&&n1[2]<0.0)continue;
-
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
-          }
-        }
-
-        glVertex3fv(v1o);
-        glVertex3fv(v2o);
-
-        glVertex3fv(v2o);
-        glVertex3fv(v3o);
-
-        glVertex3fv(v3o);
-        glVertex3fv(v1o);
-      }
-      glEnd();
-      glPopMatrix();
-    }
-
-    //*** vertices
-
-    if(show_geom_verts==1){
-      glPushMatrix();
-      glTranslatef(0.0, 0.0, geom_dz_offset);
-      glPointSize(geom_pointsize);
-      glBegin(GL_POINTS);
-
-      // points
-      glColor3fv(foregroundcolor);
-      for(i = 0; i<terrain_nfaces; i++){
-        int j;
-        int inside_domain=0, outside_domain=1;
-
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        float *n1;
-        unsigned int *ind;
-
-        ind = terrain_indices+3*i;
-
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
-        }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        n1 = v1+3;
-        if(terrain_showonly_top==1&&n1[2]<0.0)continue;
-
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
-          }
-        }
-
-        glVertex3fv(v1o);
-        glVertex3fv(v2o);
-        glVertex3fv(v3o);
-      }
-      glEnd();
-      glPopMatrix();
-    }
-
-    //*** bottom side of top surface
-
-    if(terrain_showonly_top==1&&(show_faces_shaded==1||draw_texture==1)){
-      glBegin(GL_TRIANGLES);
-
-      // surface
-      for(i = 0; i<terrain_nindices/3; i++){
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        float *n1, *n2, *n3;
-        int j;
-        unsigned int *ind;
-        float n1n[3], n2n[3], n3n[3];
-        int inside_domain=0, outside_domain=1;
-
-        ind = terrain_indices+3*i;
-
-
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
-          }
-        }
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
-        }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        n1 = v1+3;
-        if(n1[2]<0.0)continue;
-        n1n[0] = -n1[0];
-        n1n[1] = -n1[1];
-        n1n[2] = -n1[2];
+        cull_was = glIsEnabled(GL_CULL_FACE);
+        glGetIntegerv(GL_LIGHT_MODEL_TWO_SIDE, &light_model);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);
+        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
         glColor4fv(neutral_color);
-
-        glNormal3fv(n1n);
-        glVertex3fv(v1o);
-
-        n3 = v3+3;
-        n3n[0] = -n3[0];
-        n3n[1] = -n3[1];
-        n3n[2] = -n3[2];
-        glNormal3fv(n3n);
-        glVertex3fv(v3o);
-
-        n2 = v2+3;
-        n2n[0] = -n2[0];
-        n2n[1] = -n2[1];
-        n2n[2] = -n2[2];
-        glNormal3fv(n2n);
-        glVertex3fv(v2o);
+        BindTerrainGeomArrays(0, 0);
+        DrawTerrainGeomElements(terrain_geom_ebo_top, terrain_geom_n_top, GL_TRIANGLES);
+        UnbindTerrainGeomArrays();
+        glCullFace(GL_BACK);
+        if(cull_was==GL_FALSE)glDisable(GL_CULL_FACE);
+        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, light_model);
       }
-      glEnd();
+
+      if(terrain_showonly_top==0&&(show_faces_shaded==1||draw_texture==1)){
+        glColor4fv(neutral_color);
+        BindTerrainGeomArrays(0, 0);
+        DrawTerrainGeomElements(terrain_geom_ebo_side, terrain_geom_n_side, GL_TRIANGLES);
+        UnbindTerrainGeomArrays();
+      }
     }
+    else{
+      int ii, i;
+      int opaque_texture_index = -1;
+      int count = 0;
+      int is_transparent = 0;
 
-    //*** draw sides in a neutral color
+      for(i = 0; i<global_scase.terrain_texture_coll.nterrain_textures; i++){
+        texturedata *texti;
 
-    if(terrain_showonly_top==0&&(show_faces_shaded==1||draw_texture==1)){
-      glBegin(GL_TRIANGLES);
+        texti = global_scase.terrain_texture_coll.terrain_textures+i;
+        if(texti->loaded==1&&texti->display==1&&texti->is_transparent==0){
+          opaque_texture_index = i;
+          break;
+        }
+      }
 
-      // surface
-      for(i = 0; i<terrain_nindices/3; i++){
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        int j;
-        float *n1, *n2, *n3;
-        unsigned int *ind;
-        int inside_domain=0, outside_domain=1;
+      glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+      glEnable(GL_TEXTURE_2D);
+      TransparentOff();
+      for(ii = -1; ii<global_scase.terrain_texture_coll.nterrain_textures; ii++){
+        float dz;
+        texturedata *texti;
 
-        ind = terrain_indices+3*i;
+        if(ii==-1){
+          if(opaque_texture_index==-1)continue;
+          texti = global_scase.terrain_texture_coll.terrain_textures+opaque_texture_index;
+        }
+        else{
+          if(ii==opaque_texture_index)continue;
+          texti = global_scase.terrain_texture_coll.terrain_textures+ii;
+        }
+        if(texti->loaded==0||texti->display==0)continue;
+        dz = SCALE2FDS((float)(count)*FDS_OFFSET);
+        count++;
 
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
+        if(texti->is_transparent==1){
+          if(is_transparent==0){
+            is_transparent = 1;
+            TransparentOn();
           }
         }
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
+        else{
+          if(is_transparent==1){
+            is_transparent = 0;
+            TransparentOff();
+          }
         }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        n1 = v1+3;
-        if(n1[2]>=0.0)continue;
-        glColor4fv(neutral_color);
-        glNormal3fv(n1);
-        glVertex3fv(v1o);
-
-        n2 = v2+3;
-        glNormal3fv(n2);
-        glVertex3fv(v2o);
-
-        n3 = v3+3;
-        glNormal3fv(n3);
-        glVertex3fv(v3o);
+        glBindTexture(GL_TEXTURE_2D, texti->name);
+        glPushMatrix();
+        glTranslatef(0.0, 0.0, dz);
+        BindTerrainGeomArrays(0, 2);
+        DrawTerrainGeomElements(terrain_geom_ebo_top, terrain_geom_n_top, GL_TRIANGLES);
+        UnbindTerrainGeomArrays();
+        glPopMatrix();
       }
-      glEnd();
+      glDisable(GL_TEXTURE_2D);
+      if(is_transparent==1)TransparentOff();
     }
   }
   else{
-    // draw texture
+    /* fallback: immediate mode if VBOs unavailable */
+    int i;
 
-    int ii;
-    int opaque_texture_index = -1;
-
-    for(i = 0; i<global_scase.terrain_texture_coll.nterrain_textures; i++){
-      texturedata *texti;
-
-      texti = global_scase.terrain_texture_coll.terrain_textures+i;
-      if(texti->loaded==1&&texti->display==1&&texti->is_transparent==0){
-        opaque_texture_index = i;
-        break;
-      }
-    }
-
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-    glEnable(GL_TEXTURE_2D);
-
-    int count = 0;
-    int is_transparent=0;
-    TransparentOff();
-    for(ii = -1; ii<global_scase.terrain_texture_coll.nterrain_textures; ii++){
-      float dz;
-      texturedata *texti;
-
-      // draw opaque texture first
-      if(ii==-1){
-        if(opaque_texture_index==-1)continue;
-        texti = global_scase.terrain_texture_coll.terrain_textures+opaque_texture_index;
-      }
-      else{
-        if(ii==opaque_texture_index)continue;
-        texti = global_scase.terrain_texture_coll.terrain_textures+ii;
-      }
-      if(texti->loaded==0||texti->display==0)continue;
-      dz = SCALE2FDS((float)(count)*FDS_OFFSET);
-      count++;
-
-      if(texti->is_transparent==1){
-        if(is_transparent==0){
-          is_transparent = 1;
-          TransparentOn();
+    if(option==DRAW_OPAQUE){
+      if(show_faces_shaded==1&&draw_surface==1){
+        if(show_texture_1dimage==1){
+          glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+          glEnable(GL_TEXTURE_1D);
+          glBindTexture(GL_TEXTURE_1D, terrain_colorbar_id);
         }
-      }
-      else{
-        if(is_transparent==1){
-          is_transparent = 0;
-          TransparentOff();
-        }
-      }
-      glBindTexture(GL_TEXTURE_2D, texti->name);
+        glBegin(GL_TRIANGLES);
+        for(i = 0; i<terrain_nindices/3; i++){
+          float *v1, *v2, *v3;
+          float v1o[3], v2o[3], v3o[3];
+          float *c1;
+          float *n1, *n2, *n3;
+          int j;
+          unsigned int *ind;
+          int inside_domain=0, outside_domain=1;
 
-      glBegin(GL_TRIANGLES);
-
-      for(i = 0; i<terrain_nindices/3; i++){
-        float *v1, *v2, *v3;
-        float v1o[3], v2o[3], v3o[3];
-        float *n1, *n2, *n3;
-        float *t1, *t2, *t3;
-        int j;
-        unsigned int *ind;
-        int inside_domain=0, outside_domain=1;
-
-        ind = terrain_indices+3*i;
-
-        v1 = terrain_vertices+9*ind[0];
-        v2 = terrain_vertices+9*ind[1];
-        v3 = terrain_vertices+9*ind[2];
-
-        for(j = 0; j<3; j++){
-          v1o[j] = v1[j];
-          v2o[j] = v2[j];
-          v3o[j] = v3[j];
-          if(j==2){
-            v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
-            v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
-            v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
+          ind = terrain_indices+3*i;
+          c1 = terrain_colors+3*i;
+          v1 = terrain_vertices+9*ind[0];
+          v2 = terrain_vertices+9*ind[1];
+          v3 = terrain_vertices+9*ind[2];
+          for(j = 0; j<3; j++){
+            v1o[j] = v1[j];
+            v2o[j] = v2[j];
+            v3o[j] = v3[j];
+            if(j==2){
+              v1o[j] = terrain_zmin+geom_vert_exag*(v1o[j]-terrain_zmin);
+              v2o[j] = terrain_zmin+geom_vert_exag*(v2o[j]-terrain_zmin);
+              v3o[j] = terrain_zmin+geom_vert_exag*(v3o[j]-terrain_zmin);
+            }
           }
+          if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
+            inside_domain = InDomain(v1, v2, v3);
+            outside_domain = 1-inside_domain;
+          }
+          if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
+          if(showgeom_outside_domain==0&&outside_domain==1)continue;
+          n1 = v1+3;
+          if(terrain_showonly_top==1&&n1[2]<0.0)continue;
+          if(show_texture_1dimage==0)glColor3fv(c1);
+          glNormal3fv(n1);
+          if(show_texture_1dimage==1)glTexCoord1f((v1[2]-terrain_zmin)/(terrain_zmax-terrain_zmin));
+          glVertex3fv(v1o);
+          n2 = v2+3;
+          glNormal3fv(n2);
+          if(show_texture_1dimage==1)glTexCoord1f((v2[2]-terrain_zmin)/(terrain_zmax-terrain_zmin));
+          glVertex3fv(v2o);
+          n3 = v3+3;
+          glNormal3fv(n3);
+          if(show_texture_1dimage==1)glTexCoord1f((v3[2]-terrain_zmin)/(terrain_zmax-terrain_zmin));
+          glVertex3fv(v3o);
         }
-
-        if(showgeom_inside_domain_local==0||showgeom_outside_domain==0){
-          inside_domain = InDomain(v1, v2, v3);
-          outside_domain = 1-inside_domain;
-        }
-
-        if(showgeom_inside_domain_local==0&&inside_domain==1)continue;
-        if(showgeom_outside_domain==0&&outside_domain==1)continue;
-
-        t1 = terrain_tvertices+2*ind[0];
-        n1 = v1+3;
-        if(n1[2]<0.0)continue;
-        glNormal3fv(n1);
-        glTexCoord2fv(t1);
-        glVertex3f(v1o[0], v1o[1], v1o[2]+dz);
-
-        t2 = terrain_tvertices+2*ind[1];
-        n2 = v2+3;
-        glTexCoord2fv(t2);
-        glNormal3fv(n2);
-        glVertex3f(v2o[0], v2o[1], v2o[2]+dz);
-
-        t3 = terrain_tvertices+2*ind[2];
-        n3 = v3+3;
-        glTexCoord2fv(t3);
-        glNormal3fv(n3);
-        glVertex3f(v3o[0], v3o[1], v3o[2]+dz);
+        glEnd();
+        if(show_texture_1dimage == 1)glDisable(GL_TEXTURE_1D);
       }
-      glEnd();
     }
-    glDisable(GL_TEXTURE_2D);
-    if(is_transparent==1)TransparentOff();
   }
 
   glPopMatrix();
@@ -1293,6 +1470,7 @@ void InitTerrainZNode(meshdata *meshi, terraindata *terri, float xmin, float xma
 
   if(terri->file!=NULL&&terri->defined==0){
     GetTerrainData(terri->file, terri);
+    FreeTerrainOBSTVBO(terri);
     terri->defined = 1;
   }
 }
@@ -1300,24 +1478,15 @@ void InitTerrainZNode(meshdata *meshi, terraindata *terri, float xmin, float xma
 /* ------------------ DrawTerrainOBST ------------------------ */
 
 void DrawTerrainOBST(terraindata *terri, int flag){
-  float *znode;
-  unsigned char *uc_znormal;
-  int nycell;
-  int i, j;
-  float *x, *y;
   float terrain_color[4];
   float terrain_shininess=100.0;
   float terrain_specular[4]={0.8,0.8,0.8,1.0};
-  float zcut;
-
-#define ZOFFSET 0.001
+  int use_vbo;
 
   terrain_color[0]=0.47843;
   terrain_color[1]=0.45882;
   terrain_color[2]=0.18824;
   terrain_color[3]=1.0;
-
-  zcut = terri->zmin_cutoff;
 
   glPushMatrix();
   glScalef(SCALE2SMV(1.0),SCALE2SMV(1.0),SCALE2SMV(1.0));
@@ -1329,111 +1498,123 @@ void DrawTerrainOBST(terraindata *terri, int flag){
   glMaterialfv(GL_FRONT_AND_BACK,GL_SPECULAR,terrain_specular);
   glEnable(GL_COLOR_MATERIAL);
 
-  glBegin(GL_TRIANGLES);
-  uc_znormal = terri->uc_znormal;
-  znode = terri->znode;
-  nycell = terri->jbar;
-  x = terri->xplt;
-  y = terri->yplt;
+  EnsureTerrainOBSTVBO(terri, 1, 0);
+  use_vbo = (terri->vbo_valid==1 && terri->vbo!=0) ? 1 : 0;
+
   glColor4fv(terrain_color);
-  for(j=0;j<terri->jbar;j++){
-    int jp1;
+  if(use_vbo==1){
+    glBindBuffer(GL_ARRAY_BUFFER, terri->vbo);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(3, GL_FLOAT, TOBST_STRIDE, (void *)(0*sizeof(float)));
+    glEnableClientState(GL_NORMAL_ARRAY);
+    glNormalPointer(GL_FLOAT, TOBST_STRIDE, (void *)(3*sizeof(float)));
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 
-    jp1 = j + 1;
-
-    for(i=0;i<terri->ibar;i++){
-      unsigned char *uc_zn1, *uc_zn2, *uc_zn3, *uc_zn4;
-      int ip1;
-      float zval1, zval2, zval3, zval4;
-      float *zn1, *zn2, *zn3, *zn4;
-      int skip123, skip134;
-
-      ip1 = i + 1;
-
-      zval1 = znode[IJ2(i, j)];
-      zval2 = znode[IJ2(ip1, j)];
-      zval3 = znode[IJ2(ip1, jp1)];
-      zval4 = znode[IJ2(i, jp1)];
-
-      if(zval1<zcut&&zval2<zcut&&zval3<zcut&&zval4<zcut)continue;
-
-      skip123 = 0;
-      skip134 = 0;
-      if(zval1<zcut||zval2<zcut||zval3<zcut)skip123=1;
-      if(zval1<zcut||zval3<zcut||zval4<zcut)skip134=1;
-
-      zval1 += ZOFFSET;
-      zval2 += ZOFFSET;
-      zval3 += ZOFFSET;
-      zval4 += ZOFFSET;
-
-      uc_zn1 = uc_znormal+IJ2(i,j);
-      zn1 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn1));
-
-      uc_zn2 = uc_znormal+IJ2(ip1, j);
-      zn2 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn2));
-
-      uc_zn3 = uc_znormal+IJ2(ip1, jp1);
-      zn3 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn3));
-
-      uc_zn4 = uc_znormal+IJ2(i, jp1);
-      zn4 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn4));
-
-      if(flag==TERRAIN_TOP_SIDE||flag==TERRAIN_BOTH_SIDES){
-        if(skip123==0){
-          glNormal3fv(zn1);
-          glVertex3f(x[i], y[j], zval1);
-
-          glNormal3fv(zn2);
-          glVertex3f(x[i+1], y[j], zval2);
-
-          glNormal3fv(zn3);
-          glVertex3f(x[i+1], y[j+1], zval3);
-        }
-
-        if(skip134==0){
-          glNormal3fv(zn1);
-          glVertex3f(x[i], y[j], zval1);
-
-          glNormal3fv(zn3);
-          glVertex3f(x[i+1], y[j+1], zval3);
-
-          glNormal3fv(zn4);
-          glVertex3f(x[i], y[j+1], zval4);
-        }
+    if(flag==TERRAIN_TOP_SIDE||flag==TERRAIN_BOTH_SIDES){
+      if(terri->nindices>0){
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo);
+        glDrawElements(GL_TRIANGLES, terri->nindices, GL_UNSIGNED_INT, 0);
       }
+    }
+    if(flag==TERRAIN_BOTTOM_SIDE||flag==TERRAIN_BOTH_SIDES){
+      if(terri->nindices_bottom>0){
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo_bottom);
+        glDrawElements(GL_TRIANGLES, terri->nindices_bottom, GL_UNSIGNED_INT, 0);
+      }
+    }
 
-      if(flag==TERRAIN_BOTTOM_SIDE||flag==TERRAIN_BOTH_SIDES){
-        if(skip134==0){
-          glNormal3fv(zn1);
-          glVertex3f(x[i], y[j], zval1);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+  }
+  else{
+    float *znode;
+    unsigned char *uc_znormal;
+    int nycell;
+    int i, j;
+    float *x, *y;
+    float zcut;
 
-          glNormal3fv(zn4);
-          glVertex3f(x[i], y[j+1], zval4);
+    zcut = terri->zmin_cutoff;
+    glBegin(GL_TRIANGLES);
+    uc_znormal = terri->uc_znormal;
+    znode = terri->znode;
+    nycell = terri->jbar;
+    x = terri->xplt;
+    y = terri->yplt;
+    for(j=0;j<terri->jbar;j++){
+      int jp1;
+      jp1 = j + 1;
+      for(i=0;i<terri->ibar;i++){
+        unsigned char *uc_zn1, *uc_zn2, *uc_zn3, *uc_zn4;
+        int ip1;
+        float zval1, zval2, zval3, zval4;
+        float *zn1, *zn2, *zn3, *zn4;
+        int skip123, skip134;
 
-          glNormal3fv(zn3);
-          glVertex3f(x[i+1], y[j+1], zval3);
+        ip1 = i + 1;
+        zval1 = znode[IJ2(i, j)];
+        zval2 = znode[IJ2(ip1, j)];
+        zval3 = znode[IJ2(ip1, jp1)];
+        zval4 = znode[IJ2(i, jp1)];
+        if(zval1<zcut&&zval2<zcut&&zval3<zcut&&zval4<zcut)continue;
+        skip123 = 0;
+        skip134 = 0;
+        if(zval1<zcut||zval2<zcut||zval3<zcut)skip123=1;
+        if(zval1<zcut||zval3<zcut||zval4<zcut)skip134=1;
+        zval1 += ZOFFSET;
+        zval2 += ZOFFSET;
+        zval3 += ZOFFSET;
+        zval4 += ZOFFSET;
+        uc_zn1 = uc_znormal+IJ2(i,j);
+        zn1 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn1));
+        uc_zn2 = uc_znormal+IJ2(ip1, j);
+        zn2 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn2));
+        uc_zn3 = uc_znormal+IJ2(ip1, jp1);
+        zn3 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn3));
+        uc_zn4 = uc_znormal+IJ2(i, jp1);
+        zn4 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn4));
+        if(flag==TERRAIN_TOP_SIDE||flag==TERRAIN_BOTH_SIDES){
+          if(skip123==0){
+            glNormal3fv(zn1); glVertex3f(x[i], y[j], zval1);
+            glNormal3fv(zn2); glVertex3f(x[i+1], y[j], zval2);
+            glNormal3fv(zn3); glVertex3f(x[i+1], y[j+1], zval3);
+          }
+          if(skip134==0){
+            glNormal3fv(zn1); glVertex3f(x[i], y[j], zval1);
+            glNormal3fv(zn3); glVertex3f(x[i+1], y[j+1], zval3);
+            glNormal3fv(zn4); glVertex3f(x[i], y[j+1], zval4);
+          }
         }
-
-        if(skip123==0){
-          glNormal3fv(zn1);
-          glVertex3f(x[i], y[j], zval1);
-
-          glNormal3fv(zn3);
-          glVertex3f(x[i+1], y[j+1], zval3);
-
-          glNormal3fv(zn2);
-          glVertex3f(x[i+1], y[j], zval2);
+        if(flag==TERRAIN_BOTTOM_SIDE||flag==TERRAIN_BOTH_SIDES){
+          if(skip134==0){
+            glNormal3fv(zn1); glVertex3f(x[i], y[j], zval1);
+            glNormal3fv(zn4); glVertex3f(x[i], y[j+1], zval4);
+            glNormal3fv(zn3); glVertex3f(x[i+1], y[j+1], zval3);
+          }
+          if(skip123==0){
+            glNormal3fv(zn1); glVertex3f(x[i], y[j], zval1);
+            glNormal3fv(zn3); glVertex3f(x[i+1], y[j+1], zval3);
+            glNormal3fv(zn2); glVertex3f(x[i+1], y[j], zval2);
+          }
         }
       }
     }
+    glEnd();
   }
-  glEnd();
 
   glDisable(GL_COLOR_MATERIAL);
   DISABLE_LIGHTING;
 
   if(show_terrain_normals==1||show_terrain_grid==1){
+    float *znode;
+    unsigned char *uc_znormal;
+    int nycell;
+    int i, j;
+    float *x, *y;
+
     glBegin(GL_LINES);
     uc_znormal = terri->uc_znormal;
     znode = terri->znode;
@@ -1453,13 +1634,10 @@ void DrawTerrainOBST(terraindata *terri, int flag){
 
           glVertex3f(x[i],   y[j],   zval11);
           glVertex3f(x[i+1], y[j],   zval31);
-
           glVertex3f(x[i+1], y[j],   zval31);
           glVertex3f(x[i+1], y[j+1], zval33);
-
           glVertex3f(x[i+1], y[j+1], zval33);
           glVertex3f(x[i],   y[j+1], zval13);
-
           glVertex3f(x[i],   y[j+1], zval13);
           glVertex3f(x[i],   y[j],   zval11);
         }
@@ -1472,10 +1650,8 @@ void DrawTerrainOBST(terraindata *terri, int flag){
           float zval11, *zn;
 
           zval11 = znode[IJ2(i,     j)]+ZOFFSET;
-
           uc_zn = uc_znormal+IJ2(i, j);
           zn = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn));
-
           glVertex3f(x[i], y[j], zval11);
           glVertex3f(x[i]  +terrain_normal_length*zn[0],
                      y[j]  +terrain_normal_length*zn[1],
@@ -1486,7 +1662,6 @@ void DrawTerrainOBST(terraindata *terri, int flag){
     glEnd();
   }
   glPopMatrix();
-
 }
 
 /* ------------------ DrawTerrainOBSTSides ------------------------ */
@@ -1639,16 +1814,9 @@ void DrawTerrainOBSTSides(meshdata *meshi){
 /* ------------------ DrawTerrainOBSTTexture ------------------------ */
 
 void DrawTerrainOBSTTexture(terraindata *terri){
-  float *znode;
-  unsigned char *uc_znormal;
-  int nxcell,nycell;
-  int i, j;
-  float *x, *y;
   float terrain_color[4];
-  float zcut;
-
-  zcut = terri->zmin_cutoff;
-
+  int use_vbo;
+  int skip;
 
   terrain_color[0]=1.0;
   terrain_color[1]=1.0;
@@ -1667,127 +1835,118 @@ void DrawTerrainOBSTTexture(terraindata *terri){
 
   glEnable(GL_COLOR_MATERIAL);
   glColor4fv(terrain_color);
-  glBegin(GL_TRIANGLES);
-  uc_znormal = terri->uc_znormal;
-  znode = terri->znode;
-  nxcell = terri->ibar;
-  nycell = terri->jbar;
-  x = terri->xplt;
-  y = terri->yplt;
-  for(j=0;j<terri->jbar;j+=terrain_skip){
-    int jp1;
-    float ty,typ1;
-    unsigned char *uc_zn1, *uc_zn2, *uc_zn3, *uc_zn4;
 
-    jp1 = j + terrain_skip;
-    if(jp1>terri->jbar)jp1=terri->jbar;
-    ty = (y[j]-ybar0ORIG)/(ybarORIG-ybar0ORIG);
-    typ1 = (y[jp1]-ybar0ORIG)/(ybarORIG-ybar0ORIG);
+  skip = terrain_skip;
+  if(skip<1)skip = 1;
+  EnsureTerrainOBSTVBO(terri, skip, 1);
+  use_vbo = (terri->vbo_valid==2 && terri->vbo!=0) ? 1 : 0;
 
-    for(i=0;i<terri->ibar;i+=terrain_skip){
-      float *zn1, *zn2, *zn3, *zn4;
-      float zval1, zval2, zval3, zval4;
-      int ip1;
-      float tx,txp1;
-      int skip123=0, skip134=0;
+  if(use_vbo==1){
+    glBindBuffer(GL_ARRAY_BUFFER, terri->vbo);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(3, GL_FLOAT, TOBST_STRIDE, (void *)(0*sizeof(float)));
+    glEnableClientState(GL_NORMAL_ARRAY);
+    glNormalPointer(GL_FLOAT, TOBST_STRIDE, (void *)(3*sizeof(float)));
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, TOBST_STRIDE, (void *)(6*sizeof(float)));
+    glDisableClientState(GL_COLOR_ARRAY);
 
-      ip1 = i + terrain_skip;
-      if(ip1>terri->ibar)ip1=terri->ibar;
+    if(terri->nindices>0){
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo);
+      glDrawElements(GL_TRIANGLES, terri->nindices, GL_UNSIGNED_INT, 0);
+    }
+    if(terrain_showonly_top==1&&terri->nindices_bottom>0){
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, terri->ebo_bottom);
+      glDrawElements(GL_TRIANGLES, terri->nindices_bottom, GL_UNSIGNED_INT, 0);
+    }
 
-      tx = (x[i]-xbar0ORIG)/(xbarORIG-xbar0ORIG);
-      txp1 = (x[ip1]-xbar0ORIG)/(xbarORIG-xbar0ORIG);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+  }
+  else{
+    float *znode;
+    unsigned char *uc_znormal;
+    int nxcell,nycell;
+    int i, j;
+    float *x, *y;
+    float zcut;
 
-      uc_zn1 = uc_znormal+ijnode2(i,j);
-      zn1 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn1));
-      zval1 = znode[IJ2(i, j)];
+    zcut = terri->zmin_cutoff;
+    glBegin(GL_TRIANGLES);
+    uc_znormal = terri->uc_znormal;
+    znode = terri->znode;
+    nxcell = terri->ibar;
+    nycell = terri->jbar;
+    x = terri->xplt;
+    y = terri->yplt;
+    for(j=0;j<terri->jbar;j+=terrain_skip){
+      int jp1;
+      float ty,typ1;
 
-      uc_zn2 = uc_znormal+ijnode2(ip1, j);
-      zn2 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn2));
-      zval2 = znode[IJ2(ip1, j)];
+      jp1 = j + terrain_skip;
+      if(jp1>terri->jbar)jp1=terri->jbar;
+      ty = (y[j]-ybar0ORIG)/(ybarORIG-ybar0ORIG);
+      typ1 = (y[jp1]-ybar0ORIG)/(ybarORIG-ybar0ORIG);
+      for(i=0;i<terri->ibar;i+=terrain_skip){
+        float *zn1, *zn2, *zn3, *zn4;
+        float zval1, zval2, zval3, zval4;
+        int ip1;
+        float tx,txp1;
+        int skip123=0, skip134=0;
+        unsigned char *uc_zn1, *uc_zn2, *uc_zn3, *uc_zn4;
 
-      uc_zn3 = uc_znormal+ijnode2(ip1, jp1);
-      zn3 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn3));
-      zval3 = znode[IJ2(ip1, jp1)];
-
-      uc_zn4 = uc_znormal+ijnode2(i, jp1);
-      zn4 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn4));
-      zval4 = znode[IJ2(i, jp1)];
-
-      if(zval1<zcut&&zval2<zcut&&zval3<zcut&&zval4<zcut)continue;
-
-      skip123 = 0;
-      skip134 = 0;
-      if(zval1<zcut||zval2<zcut||zval3<zcut)skip123=1;
-      if(zval1<zcut||zval3<zcut||zval4<zcut)skip134=1;
-
-      if(skip123==0){
-        glNormal3fv(zn1);
-        glTexCoord2f(tx,ty);
-        glVertex3f(x[i],y[j],zval1);
-
-
-        glNormal3fv(zn2);
-        glTexCoord2f(txp1,ty);
-        glVertex3f(x[ip1],y[j],zval2);
-
-
-        glNormal3fv(zn3);
-        glTexCoord2f(txp1,typ1);
-        glVertex3f(x[ip1],y[jp1],zval3);
-      }
-
-      if(skip134==0){
-        glNormal3fv(zn1);
-        glTexCoord2f(tx,ty);
-        glVertex3f(x[i],y[j],zval1);
-
-        glNormal3fv(zn3);
-        glTexCoord2f(txp1,typ1);
-        glVertex3f(x[ip1],y[jp1],zval3);
-
-        glNormal3fv(zn4);
-        glTexCoord2f(tx,typ1);
-        glVertex3f(x[i],y[jp1],zval4);
-      }
-
-      if(terrain_showonly_top==1){
-        if(skip134==0){
-          glNormal3fv(zn1);
-          glTexCoord2f(tx,ty);
-          glVertex3f(x[i],y[j],zval1);
-
-          glNormal3fv(zn4);
-          glTexCoord2f(tx,typ1);
-          glVertex3f(x[i],y[jp1],zval4);
-
-          glNormal3fv(zn3);
-          glTexCoord2f(txp1,typ1);
-          glVertex3f(x[ip1],y[jp1],zval3);
-        }
-
+        ip1 = i + terrain_skip;
+        if(ip1>terri->ibar)ip1=terri->ibar;
+        tx = (x[i]-xbar0ORIG)/(xbarORIG-xbar0ORIG);
+        txp1 = (x[ip1]-xbar0ORIG)/(xbarORIG-xbar0ORIG);
+        uc_zn1 = uc_znormal+ijnode2(i,j);
+        zn1 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn1));
+        zval1 = znode[IJ2(i, j)];
+        uc_zn2 = uc_znormal+ijnode2(ip1, j);
+        zn2 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn2));
+        zval2 = znode[IJ2(ip1, j)];
+        uc_zn3 = uc_znormal+ijnode2(ip1, jp1);
+        zn3 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn3));
+        zval3 = znode[IJ2(ip1, jp1)];
+        uc_zn4 = uc_znormal+ijnode2(i, jp1);
+        zn4 = GetNormalVectorPtr(global_scase.wui_sphereinfo, (unsigned int)(*uc_zn4));
+        zval4 = znode[IJ2(i, jp1)];
+        if(zval1<zcut&&zval2<zcut&&zval3<zcut&&zval4<zcut)continue;
+        if(zval1<zcut||zval2<zcut||zval3<zcut)skip123=1;
+        if(zval1<zcut||zval3<zcut||zval4<zcut)skip134=1;
         if(skip123==0){
-          glNormal3fv(zn1);
-          glTexCoord2f(tx,ty);
-          glVertex3f(x[i],y[j],zval1);
-
-          glNormal3fv(zn3);
-          glTexCoord2f(txp1,typ1);
-          glVertex3f(x[ip1],y[jp1],zval3);
-
-          glNormal3fv(zn2);
-          glTexCoord2f(txp1,ty);
-          glVertex3f(x[ip1],y[j],zval2);
+          glNormal3fv(zn1); glTexCoord2f(tx,ty); glVertex3f(x[i],y[j],zval1);
+          glNormal3fv(zn2); glTexCoord2f(txp1,ty); glVertex3f(x[ip1],y[j],zval2);
+          glNormal3fv(zn3); glTexCoord2f(txp1,typ1); glVertex3f(x[ip1],y[jp1],zval3);
+        }
+        if(skip134==0){
+          glNormal3fv(zn1); glTexCoord2f(tx,ty); glVertex3f(x[i],y[j],zval1);
+          glNormal3fv(zn3); glTexCoord2f(txp1,typ1); glVertex3f(x[ip1],y[jp1],zval3);
+          glNormal3fv(zn4); glTexCoord2f(tx,typ1); glVertex3f(x[i],y[jp1],zval4);
+        }
+        if(terrain_showonly_top==1){
+          if(skip134==0){
+            glNormal3fv(zn1); glTexCoord2f(tx,ty); glVertex3f(x[i],y[j],zval1);
+            glNormal3fv(zn4); glTexCoord2f(tx,typ1); glVertex3f(x[i],y[jp1],zval4);
+            glNormal3fv(zn3); glTexCoord2f(txp1,typ1); glVertex3f(x[ip1],y[jp1],zval3);
+          }
+          if(skip123==0){
+            glNormal3fv(zn1); glTexCoord2f(tx,ty); glVertex3f(x[i],y[j],zval1);
+            glNormal3fv(zn3); glTexCoord2f(txp1,typ1); glVertex3f(x[ip1],y[jp1],zval3);
+            glNormal3fv(zn2); glTexCoord2f(txp1,ty); glVertex3f(x[ip1],y[j],zval2);
+          }
         }
       }
     }
+    glEnd();
   }
-  glEnd();
 
   glDisable(GL_TEXTURE_2D);
-
   glDisable(GL_COLOR_MATERIAL);
   DISABLE_LIGHTING;
-
   glPopMatrix();
 }
 
@@ -1870,6 +2029,7 @@ void UpdateTerrain(int allocate_memory){
           terraindata *terri;
 
           terri = global_scase.terraininfo+i;
+          memset(terri, 0, sizeof(terraindata));
           terri->defined = 0;
         }
       }
@@ -1904,6 +2064,9 @@ void UpdateTerrain(int allocate_memory){
     }
     if(global_scase.manual_terrain==1){
       ComputeTerrainNormalsManual();
+    }
+    for(i = 0; i<global_scase.nterraininfo; i++){
+      FreeTerrainOBSTVBO(global_scase.terraininfo+i);
     }
   }
   if(allocate_memory==1){

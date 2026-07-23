@@ -6164,6 +6164,7 @@ int ReadSMV_Parse(smv_case *scase, bufferstreamdata *stream){
       strcpy(file, buffer_ptr);
 
       terraini = scase->terraininfo + scase->nterraininfo;
+      memset(terraini, 0, sizeof(terraindata));
       terraini->file = file;
       if(mesh_terrain==-1){
         mesh_terrain = scase->nterraininfo;    // no mesh_terrain on TERRAIN line so assume that number of TERRAIN and MESH lines are the same

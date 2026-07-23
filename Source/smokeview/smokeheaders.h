@@ -617,6 +617,8 @@ EXTERNCPP void DrawTerrainOBSTSides(meshdata *meshi);
 EXTERNCPP void DrawTerrainOBSTTexture(terraindata *terri);
 EXTERNCPP void DrawNorth(void);
 EXTERNCPP void DrawTrees(void);
+EXTERNCPP void FreeTerrainGeomVBO(void);
+EXTERNCPP void FreeTerrainOBSTVBO(terraindata *terri);
 EXTERNCPP void GenerateTerrainGeom(float **vertices_arg, unsigned int **indices_arg, int *nindices_arg);
 EXTERNCPP float GetZCellValOffset(meshdata *meshi,float xval, float yval, int *loc);
 EXTERNCPP int  HaveTerrainSlice(void);
